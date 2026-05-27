@@ -14,7 +14,7 @@ def prep_data(binned=False):
                        header=0,
                        skipinitialspace=True)
 
-    dta = dta1.append(dta2)
+    dta = pd.concat([dta1, dta2], ignore_index=True)
 
     dta.sex = dta.sex.replace({"M": 0, "F": 1})
     dta = pd.get_dummies(dta)

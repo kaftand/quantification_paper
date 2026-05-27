@@ -19,8 +19,8 @@ CDE;DM;QFY.distribution_matching;CDE;No;1;1;prob;1
 CC;CC;QFY.classification_models;CC;Yes;1;1;crisp;1
 PCC;CC;QFY.classification_models;PCC;Yes;1;1;prob;1
 PWK;CC;QFY.classification_models;PWK;Yes;1;1;none;1
-SVM-K;CC;QFY.classification_models;SVM_KLD;No;1;1;none;0
-SVM-Q;CC;QFY.classification_models;SVM_Q;No;1;1;none;0
 RBF-K;CC;QFY.classification_models;RBF_KLD;No;1;1;none;1
 RBF-Q;CC;QFY.classification_models;RBF_Q;No;1;1;none;1
+QTreeEM;CC;QFY.classification_models;QTreeEM;No;1;1;none;0
+QForestEM;CC;QFY.classification_models;QForestEM;No;1;1;none;0
 QF;CC;QFY.classification_models;QuantificationForest;Yes;0;0;none;0

@@ -13,7 +13,7 @@ class QuantificationForest(Quantifier):
     def __init__(self, qforest_path, id_str = None, n_trees=100, seed=None):
 
         Quantifier.__init__(self)
-        self.qforest_path = qforest_path
+        self.qforest_path = r"C:\Users\kaftad01\OneDrive - NYU Langone Health\code\ReproduceQuantificationTrees\jar"#qforest_path
         assert Path(
             qforest_path).is_dir(), "The directory of the quantification tree executables weka.jar and quantify.jar " \
                                     "needs to be stored in QFOREST_PATH. These executables were kindly provided to " \

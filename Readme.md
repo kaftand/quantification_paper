@@ -28,6 +28,14 @@ Regarding the structure of this repository, we would like to note that specifica
 
 All experiments have been run with Python 3.7. An environment including all packages required to run (almost) our code is given in the ```quant.yml``` file in the ```envs```folder - only the ```quapy.ipynb``` notebook requires another environment, which can be installed via ```quapy.yml```. Along with standard packages such as ```numpy```, ```pandas``` or ```scikit-learn```, the ```cvxpy``` package [(link)](https://www.cvxpy.org/) is of particular importance for many algorithms in our experiments.
 
+On Windows, if you work with the conda-based ```quant``` environment, prefer launching Python through Conda, for example:
+
+```bash
+    conda run -n quant --no-capture-output python -m pytest tests/test_qforest_em.py
+```
+
+This avoids DLL loading issues that can appear when running the raw interpreter directly.
+
 
 #### Loading Datasets
 
@@ -85,6 +93,8 @@ where specifying no argument will, by default, run all experiments in sequence (
 ### Algorithms
 
 The implementations of all quantification algorithms can be found in the ```QFY``` folder. This has been set up as a Python module and can be run independent from our experiments. The main rationale behind the implementation was to mimic the functionality that one may know from ```skcikit-learn```. Thus, every quantifier has a ```fit()``` and ```predict()``` function, and parameters have to be declared upon initialization of a quantifier. Note that the SVMperf-based methods and the quantification forests require additional code to be run, as has been mentioned above.
+
+The tree-based EM quantifiers added in this branch are available as ```QFY.classification_models.QTreeEM``` and ```QFY.classification_models.QForestEM```, with a small smoke test in ```tests/test_qforest_em.py```. They are also registered for the main experiment runners via ```quantifier_index.csv```.
 
 
 ### Processing the Results

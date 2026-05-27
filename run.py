@@ -137,7 +137,7 @@ def data_synth_experiments(
         return
 
     print(dta_name)
-    X, y, N, Y, n_classes, y_cts, y_idx = helpers.get_xy(dta_name, load_from_disk=True, binned=binned)
+    X, y, N, Y, n_classes, y_cts, y_idx = helpers.get_xy(dta_name, load_from_disk=False, binned=binned)
 
     n_combs = len(dt_ratios) * len(train_ds) * len(test_ds)
 

@@ -122,9 +122,13 @@ QUANTIFIER_INDEX = pd.read_csv("quantifier_index.csv",
 
 QUANTIFIER_LIST = list(QUANTIFIER_INDEX.index)
 
-QUANTIFIER_DICT = dict({qf: load_class(QUANTIFIER_INDEX.loc[qf, "module_name"],
-                                       QUANTIFIER_INDEX.loc[qf, "class_name"])
-                        for qf in QUANTIFIER_LIST})
+_SKIP_QUANTIFIER_IMPORTS = os.getenv("SKIP_QUANTIFIER_IMPORTS", "0") == "1"
+if _SKIP_QUANTIFIER_IMPORTS:
+    QUANTIFIER_DICT = {}
+else:
+    QUANTIFIER_DICT = dict({qf: load_class(QUANTIFIER_INDEX.loc[qf, "module_name"],
+                                           QUANTIFIER_INDEX.loc[qf, "class_name"])
+                            for qf in QUANTIFIER_LIST})
 
 # ----------------------------------------------------------------------------------------------------------------------
 # Column names for result tables
@@ -146,14 +150,28 @@ PROCESSED_RESULTS_KEY_COLUMNS = ['Seed', 'TT_split', 'D_train', 'D_test', 'datas
 # Variables for Main Experiments
 # ==============================================================================
 
-DEFAULT_QUANTIFIER_LIST = QUANTIFIER_LIST[:-5]  # exclude SVMperf and Qforest quantifiers from default
+DEFAULT_QUANTIFIER_LIST = [
+    qf for qf in QUANTIFIER_LIST
+    if qf not in ["SVM-K", "SVM-Q", "RBF-K", "RBF-Q", "QF"]
+]  # exclude SVMperf and Qforest quantifiers from default
 
 SVMPERF_QUANTIFIER_LIST = ["SVM-K", "SVM-Q", "RBF-K", "RBF-Q"]
 
 QFOREST_COLUMN_NAMES = ["QF", "QF-AC"]
 
 # default parameters that are shared over multiple quantifiers
-DEFAULT_PARAMS_LOGISTIC_REGRESSOR = LogisticRegression(solver="lbfgs", max_iter=1000, multi_class='auto')
+try:
+    DEFAULT_PARAMS_LOGISTIC_REGRESSOR = LogisticRegression(
+        solver="lbfgs",
+        max_iter=1000,
+        multi_class="auto",
+    )
+except TypeError:
+    # Older sklearn versions do not accept multi_class.
+    DEFAULT_PARAMS_LOGISTIC_REGRESSOR = LogisticRegression(
+        solver="lbfgs",
+        max_iter=1000,
+    )
 DEFAULT_PARAMS_NUMBER_FOLDS_IN_CM_ESTIMATION = 10
 DEFAULT_PARAMS_THRESHOLD_PRECISION = 3
 DEFAULT_PARAMS_ITERATOR_EPSILON = 1e-06
@@ -255,6 +273,24 @@ QUANTIFIER_DEFAULT_PARAMETER_DICT = {
             "metric_params": None,
             "n_jobs": None
             },
+    "QTreeEM": {"alpha": 1.0,
+                "tol": DEFAULT_PARAMS_ITERATOR_EPSILON,
+                "max_iter": DEFAULT_PARAMS_ITERATOR_MAX_ITERATIONS,
+                "max_depth": None,
+                "min_samples_leaf": 1,
+                "max_features": "sqrt",
+                "random_state": None
+                },
+    "QForestEM": {"n_estimators": 100,
+                   "max_depth": None,
+                   "min_samples_leaf": 1,
+                   "max_features": "sqrt",
+                   "alpha": 1.0,
+                   "tol": DEFAULT_PARAMS_ITERATOR_EPSILON,
+                   "max_iter": DEFAULT_PARAMS_ITERATOR_MAX_ITERATIONS,
+                   "random_state": None,
+                   "calibration_prune": True
+                   },
     "QF": {"qforest_path": QFOREST_PATH,
            "n_trees": 100
            }

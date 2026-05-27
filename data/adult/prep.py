@@ -49,13 +49,15 @@ def prep_data(binned=False):
                            index_col=False,
                            skipinitialspace=True)
 
-    dta = dta_train.append(dta_test)
+    dta = pd.concat([dta_train, dta_test], ignore_index=True)
     dta = dta.loc[:, feat_cols]
     dta = dta.dropna()
     dta = dta.reset_index(drop=True)
-    dta.Income = dta.Income.replace({"<=50K": 0, "<=50K.": 0, ">50K.": 1, ">50K": 1})
+    dta["Income"] = dta["Income"].replace({"<=50K": 0, "<=50K.": 0, ">50K.": 1, ">50K": 1})
+    dta["Income"] = dta["Income"].astype("int64")
     dta["Age"] = pd.to_numeric(dta["Age"])
-    dta = pd.get_dummies(dta)
+    object_cols = dta.select_dtypes(include=["object"]).columns
+    dta = pd.get_dummies(dta, columns=object_cols)
 
     # dta.to_pickle("dta.pkl")
 

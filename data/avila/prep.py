@@ -21,7 +21,7 @@ def prep_data(binned=False):
                           names=colnames,
                           skipinitialspace=True)
 
-    dta = df_train.append(df_test, ignore_index=True)
+    dta = pd.concat([df_train, df_test], ignore_index=True)
 
     dta.loc[dta['Class'] != "A", 'Class'] = "B"
     dta.Class = dta.Class.replace({"A": 0, "B": 1})

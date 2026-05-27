@@ -24,8 +24,7 @@ def prep_data(binned=False):
                            header=0,
                            skipinitialspace=True)
 
-    dta = df_train.append(df_test1, ignore_index=True)
-    dta = dta.append(df_test2, ignore_index=True)
+    dta = pd.concat([df_train, df_test1, df_test2], ignore_index=True)
 
     dta = dta.drop("date", axis=1)
 

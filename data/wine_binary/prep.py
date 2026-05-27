@@ -15,7 +15,7 @@ def prep_data(binned=False):
                           skipinitialspace=True)
     dta_red.insert(0, 'type', 'red')
 
-    dta = dta_white.append(dta_red)
+    dta = pd.concat([dta_white, dta_red], ignore_index=True)
 
     dta = pd.get_dummies(dta)
 
