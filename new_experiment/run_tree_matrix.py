@@ -9,6 +9,7 @@ from quapy.method.aggregative import KDEyML, EMQ, ACC, PACC
 from quapy.data import LabelledCollection
 from quapy.protocol import APP
 from sklearn.linear_model import LogisticRegression
+from sklearn.calibration import CalibratedClassifierCV
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 if ROOT_DIR not in sys.path:
@@ -42,7 +43,9 @@ from new_experiment.impl import (
 )
 
 
-class TreePosteriorClassifier(BaseEstimator, ClassifierMixin):
+class TreePosteriorClassifier(ClassifierMixin, BaseEstimator):
+    _estimator_type = "classifier"
+
     def __init__(self, tree=None, alpha=0.01, min_calibration_samples=0, expected_classes=None):
         self.tree = tree
         self.alpha = alpha
@@ -151,7 +154,7 @@ class TreePosteriorClassifier(BaseEstimator, ClassifierMixin):
         return self.classes_[np.argmax(proba, axis=1)]
 
 TREE_CHOICES = ["gini", "qeb", "qcqb"]
-ESTIMATOR_CHOICES = ["em", "em_smooth", "acc", "sld", "kdey"]
+ESTIMATOR_CHOICES = ["em", "em_smooth", "acc", "sld", "platt_sld", "lr_platt_sld", "kdey"]
 
 
 def _calc_eps(n):
@@ -432,6 +435,73 @@ def _kdey_quantify_quapy(
 
     return pi_hat
 
+
+def _calibrate_probabilities_with_sigmoid(probs_val, y_val, probs_test, classes):
+    """Calibrate class probabilities with one-vs-rest sigmoid models on validation data."""
+    probs_val = np.asarray(probs_val, dtype=float)
+    probs_test = np.asarray(probs_test, dtype=float)
+    y_val = np.asarray(y_val)
+    classes = np.asarray(classes)
+
+    calibrated = np.zeros_like(probs_test, dtype=float)
+    for idx, cls in enumerate(classes):
+        y_bin = (y_val == cls).astype(int)
+        if np.unique(y_bin).size < 2:
+            calibrated[:, idx] = probs_test[:, idx]
+            continue
+
+        calibrator = LogisticRegression(max_iter=1000, solver="lbfgs")
+        calibrator.fit(probs_val[:, [idx]], y_bin)
+        calibrated[:, idx] = calibrator.predict_proba(probs_test[:, [idx]])[:, 1]
+
+    row_sums = calibrated.sum(axis=1, keepdims=True)
+    row_sums[row_sums <= 0] = 1.0
+    return calibrated / row_sums
+
+
+def _align_probabilities_to_classes(probs, model_classes, expected_classes):
+    """Expand a probability matrix to the expected class set, filling missing classes with zeros."""
+    probs = np.asarray(probs, dtype=float)
+    model_classes = np.asarray(model_classes)
+    expected_classes = np.asarray(expected_classes)
+
+    aligned = np.zeros((probs.shape[0], len(expected_classes)), dtype=float)
+    class_to_col = {cls: idx for idx, cls in enumerate(model_classes)}
+    for idx, cls in enumerate(expected_classes):
+        col = class_to_col.get(cls, None)
+        if col is not None and col < probs.shape[1]:
+            aligned[:, idx] = probs[:, col]
+    return aligned
+
+
+def _platt_sld_quantify(tree, X_train, y_train, X_val, y_val, X_test, classes,
+                        min_calibration_samples=0):
+    """Calibrate tree posterior scores with Platt scaling, then run SLD."""
+    base = TreePosteriorClassifier(
+        tree=tree,
+        alpha=0.01,
+        min_calibration_samples=min_calibration_samples,
+        expected_classes=classes,
+    )
+    base.fit(X_train, y_train)
+    probs_val = _align_probabilities_to_classes(base.predict_proba(X_val), base.classes_, classes)
+    probs_test = _align_probabilities_to_classes(base.predict_proba(X_test), base.classes_, classes)
+    scores_test = _calibrate_probabilities_with_sigmoid(probs_val, y_val, probs_test, classes)
+    pi_train = _prevalence(y_train, classes)
+    return _sld_em(scores_test, init_pi=pi_train)
+
+
+def _lr_platt_sld_quantify(X_train, y_train, X_val, y_val, X_test, classes):
+    """Fit logistic regression on train, Platt-calibrate on val, then run SLD on test."""
+    base = LogisticRegression(max_iter=1000, solver="lbfgs")
+    base.fit(X_train, y_train)
+
+    probs_val = _align_probabilities_to_classes(base.predict_proba(X_val), base.classes_, classes)
+    probs_test = _align_probabilities_to_classes(base.predict_proba(X_test), base.classes_, classes)
+    scores_test = _calibrate_probabilities_with_sigmoid(probs_val, y_val, probs_test, classes)
+    pi_train = _prevalence(y_train, classes)
+    return _sld_em(scores_test, init_pi=pi_train)
+
 def _sld_em(scores, init_pi, tol=1e-6, max_iter=1000):
     """Saerens et al. EM for adjusting posteriors and estimating prevalence."""
     scores = np.asarray(scores, dtype=float)
@@ -483,8 +553,8 @@ def run_dataset(
             qeb_max_thresholds=qeb_max_thresholds,
         )
         # Ensure labels are discrete integer indices expected by sklearn
-        class_list = np.array(Y)
-        class_to_idx = {c: i for i, c in enumerate(class_list)}
+        class_list = np.arange(len(Y))
+        class_to_idx = {c: i for i, c in enumerate(Y)}
 
         def _map_labels(arr):
             return np.array([class_to_idx.get(v, v) for v in arr])
@@ -494,7 +564,7 @@ def run_dataset(
         y_test = _map_labels(y_test)
 
         # Recompute true prevalence to match mapped labels
-        pi_true = _prevalence(y_test, np.arange(len(class_list)))
+        pi_true = _prevalence(y_test, class_list)
 
         tree.fit(X_train, y_train)
         leaf_ids_val = tree.get_leaf_indices(X_val)
@@ -550,6 +620,34 @@ def run_dataset(
                     )
                     pi_hat = _sld_em(scores_test, init_pi=pi_train)
 
+                elif est_name == "platt_sld":
+                    # Platt-calibrated posterior scores followed by SLD.
+                    P, leaf_to_row, classes, _ = get_P(0.0)
+                    pi_true_local = _prevalence(y_test, classes)
+                    pi_hat = _platt_sld_quantify(
+                        tree=tree,
+                        X_train=X_train,
+                        y_train=y_train,
+                        X_val=X_val,
+                        y_val=y_val,
+                        X_test=X_test,
+                        classes=classes,
+                        min_calibration_samples=min_cal,
+                    )
+
+                elif est_name == "lr_platt_sld":
+                    # Logistic regression -> Platt scaling -> SLD comparator.
+                    P, leaf_to_row, classes, _ = get_P(0.0)
+                    pi_true_local = _prevalence(y_test, classes)
+                    pi_hat = _lr_platt_sld_quantify(
+                        X_train=X_train,
+                        y_train=y_train,
+                        X_val=X_val,
+                        y_val=y_val,
+                        X_test=X_test,
+                        classes=classes,
+                    )
+
                 elif est_name == "kdey":
                     # =====================================================
                     # USE QUAPY's KDEyML — PROPER IMPLEMENTATION
@@ -572,7 +670,6 @@ def run_dataset(
                         seed=seed,
                         min_calibration_samples=min_cal,
                     )
-                    classes = Y
                     pi_true_local = _prevalence(y_test, classes)
 
                 else:
