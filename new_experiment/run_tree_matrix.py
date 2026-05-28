@@ -43,15 +43,16 @@ from new_experiment.impl import (
 
 
 class TreePosteriorClassifier(BaseEstimator, ClassifierMixin):
-    def __init__(self, tree=None, alpha=0.01, min_calibration_samples=0):
+    def __init__(self, tree=None, alpha=0.01, min_calibration_samples=0, expected_classes=None):
         self.tree = tree
         self.alpha = alpha
         self.min_calibration_samples = min_calibration_samples
+        self.expected_classes = expected_classes
 
     def fit(self, X, y):
         X = np.asarray(X)
         y = np.asarray(y)
-        self.classes_ = np.unique(y)
+        self.classes_ = np.asarray(self.expected_classes) if self.expected_classes is not None else np.unique(y)
         self.n_classes_ = len(self.classes_)
 
         self.tree.fit(X, y)
@@ -116,7 +117,7 @@ class TreePosteriorClassifier(BaseEstimator, ClassifierMixin):
 
         # Build transfer matrix from (possibly pruned) data
         estimator = HoldoutTransferMatrixEstimator(alpha=self.alpha)
-        estimator.fit(leaf_ids_filtered, y_filtered)
+        estimator.fit(leaf_ids_filtered, y_filtered, classes=self.expected_classes)
         self.P_ = estimator.P_
         self.leaf_to_row_ = estimator.leaf_to_row
 
@@ -296,7 +297,7 @@ def _counts_from_leaf_ids(leaf_ids, leaf_to_row, n_rows):
     return np.bincount(rows[mask], minlength=n_rows)
 
 
-def _build_transfer_matrix(leaf_ids_val, y_val, min_calibration_samples, alpha=0.0):
+def _build_transfer_matrix(leaf_ids_val, y_val, min_calibration_samples, alpha=0.0, expected_classes=None):
     """Build transfer matrix with leaf redirection for pruned leaves.
     
     Returns (P, leaf_to_row, classes, leaf_redirect) where leaf_redirect
@@ -323,7 +324,7 @@ def _build_transfer_matrix(leaf_ids_val, y_val, min_calibration_samples, alpha=0
         y_val_filtered = y_val[keep_mask]
 
         estimator = HoldoutTransferMatrixEstimator(alpha=alpha)
-        estimator.fit(leaf_ids_filtered, y_val_filtered)
+        estimator.fit(leaf_ids_filtered, y_val_filtered, classes=expected_classes)
 
         # Build redirect map for pruned leaves
         if len(pruned_leaves) > 0 and len(keep_leaves) > 0:
@@ -364,7 +365,7 @@ def _build_transfer_matrix(leaf_ids_val, y_val, min_calibration_samples, alpha=0
         return estimator.P_, estimator.leaf_to_row, estimator.classes_, leaf_redirect
 
     estimator = HoldoutTransferMatrixEstimator(alpha=alpha)
-    estimator.fit(leaf_ids_val, y_val)
+    estimator.fit(leaf_ids_val, y_val, classes=expected_classes)
     return estimator.P_, estimator.leaf_to_row, estimator.classes_, leaf_redirect
 
 
@@ -405,7 +406,12 @@ def _kdey_quantify_quapy(
     from quapy.method.aggregative import KDEyML
     from sklearn.linear_model import LogisticRegression
 
-    wrapper = TreePosteriorClassifier(tree=tree, alpha=0.01, min_calibration_samples=min_calibration_samples)
+    wrapper = TreePosteriorClassifier(
+        tree=tree,
+        alpha=0.01,
+        min_calibration_samples=min_calibration_samples,
+        expected_classes=classes,
+    )
         #max_iter=1000,
        # random_state=seed,
     #)
@@ -502,6 +508,7 @@ def run_dataset(
                 if key not in P_cache:
                     P_cache[key] = _build_transfer_matrix(
                         leaf_ids_val, y_val, min_cal, alpha=alpha,
+                        expected_classes=class_list,
                     )
                 return P_cache[key]
 

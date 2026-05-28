@@ -11,11 +11,14 @@ class HoldoutTransferMatrixEstimator:
     def __init__(self, alpha=0.0):
         self.alpha = float(alpha)
 
-    def fit(self, leaf_indices, y):
+    def fit(self, leaf_indices, y, classes=None):
         leaf_indices = np.asarray(leaf_indices)
         y = np.asarray(y)
         self.leaves_ = np.unique(leaf_indices)
-        self.classes_, inv = np.unique(y, return_inverse=True)
+        if classes is None:
+            self.classes_, inv = np.unique(y, return_inverse=True)
+        else:
+            self.classes_ = np.asarray(classes)
         n_leaves = len(self.leaves_)
         n_classes = len(self.classes_)
         P = np.zeros((n_leaves, n_classes), dtype=float)
