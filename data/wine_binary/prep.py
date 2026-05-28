@@ -17,7 +17,11 @@ def prep_data(binned=False):
 
     dta = pd.concat([dta_white, dta_red], ignore_index=True)
 
-    dta = pd.get_dummies(dta)
+    target_col = "quality"
+    object_cols = dta.select_dtypes(include=["object"]).columns
+    object_cols = [col for col in object_cols if col != target_col]
+    if object_cols:
+        dta = pd.get_dummies(dta, columns=object_cols)
 
     bins = [0, 5, 10]
     labels = [0, 1]

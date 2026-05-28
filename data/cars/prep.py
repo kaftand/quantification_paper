@@ -23,7 +23,11 @@ def prep_data():
                                            "good": 2,
                                            "vgood": 3})
 
-    dta = pd.get_dummies(dta)
+    target_col = "acc_class"
+    object_cols = dta.select_dtypes(include=["object"]).columns
+    object_cols = [col for col in object_cols if col != target_col]
+    if object_cols:
+        dta = pd.get_dummies(dta, columns=object_cols)
 
     return dta
 

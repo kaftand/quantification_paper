@@ -23,7 +23,11 @@ def prep_data(binned=False):
                                    "CL5": 1,
                                    "CL6": 1})
 
-    dta = pd.get_dummies(dta)
+    target_col = "att28"
+    object_cols = dta.select_dtypes(include=["object"]).columns
+    object_cols = [col for col in object_cols if col != target_col]
+    if object_cols:
+        dta = pd.get_dummies(dta, columns=object_cols)
 
     if binned:
         for col in list(dta)[:12]:

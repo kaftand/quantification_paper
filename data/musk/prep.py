@@ -1,9 +1,11 @@
 
+import os
 import pandas as pd
 
 
 def prep_data(binned=False):
-    url = "clean2.data"
+    local_path = os.path.join(os.path.dirname(__file__), "clean2.data")
+    url = local_path if os.path.exists(local_path) else "clean2.data"
 
     colnames = ["att" + str(i - 1) for i in range(169)]
 

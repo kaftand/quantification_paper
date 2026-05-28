@@ -9,8 +9,7 @@ def prep_data(binned=False):
 
     dta = pd.read_excel(url,
                         header=0,
-                        names=colnames,
-                        skipinitialspace=True)
+                        names=colnames)
 
     bins = [0, 35, 100]
     labels = [0, 1]

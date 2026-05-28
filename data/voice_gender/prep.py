@@ -1,9 +1,14 @@
 
+import os
+
 import pandas as pd
 
 
 def prep_data(binned=False):
-    url = "voice.csv"
+    local_path = os.path.join(os.path.dirname(__file__), "voice.csv")
+    url = local_path if os.path.exists(local_path) else (
+        "https://raw.githubusercontent.com/primaryobjects/voice-gender/master/voice.csv"
+    )
 
     dta = pd.read_csv(url,
                       header=0,

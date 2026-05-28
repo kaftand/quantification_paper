@@ -1,9 +1,12 @@
 
+import os
+
 import pandas as pd
 
 
 def prep_data(binned=False):
-    url = "all-data-raw.csv"
+    local_path = os.path.join(os.path.dirname(__file__), "../theorem/all-data-raw.csv")
+    url = local_path if os.path.exists(local_path) else os.environ.get("THEOREM_URL", "all-data-raw.csv")
 
     colnames = ["att" + str(i + 1) for i in range(58)]
 

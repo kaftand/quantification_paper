@@ -36,7 +36,11 @@ def prep_data():
     dta.result = dta.result.replace({"p": 0, "e": 1})
     dta['ring-number'] = dta['ring-number'].replace({"n": 0, "o": 1, "t": 2})
     dta = dta.drop(columns=['stalk-root'])
-    dta = pd.get_dummies(dta)
+    target_col = "result"
+    object_cols = dta.select_dtypes(include=["object"]).columns
+    object_cols = [col for col in object_cols if col != target_col]
+    if object_cols:
+        dta = pd.get_dummies(dta, columns=object_cols)
 
     return dta
 
