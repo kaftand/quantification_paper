@@ -6,7 +6,6 @@ import numpy as np
 import pandas as pd
 from sklearn.linear_model import LogisticRegression
 from sklearn.base import BaseEstimator, ClassifierMixin
-from sklearn.metrics import confusion_matrix
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 if ROOT_DIR not in sys.path:
@@ -28,166 +27,174 @@ from new_experiment.impl import (
     ClassificationTree,
     QuantificationErrorBalancingTree,
     ClassificationQuantificationBalancingTree,
+    HoldoutTransferMatrixEstimator,
 )
 
-try:
-    from quapy.method.aggregative import KDEyML
-    QUAPY_AVAILABLE = True
-except ImportError:
-    QUAPY_AVAILABLE = False
+import quapy as qp
+from quapy.method.aggregative import ACC, EMQ, KDEyML
+from quapy.data import LabelledCollection
 
 
 # =============================================================================
-# Calibration Support Pruned Tree [1]
+# Pruned Tree Classifier (sklearn-compatible wrapper)
 # =============================================================================
 
-class CalibrationSupportPrunedTree:
+class PrunedTreeClassifier(ClassifierMixin, BaseEstimator):
     """
-    Wraps a fitted tree and constrains test-time traversal so that every
-    sample lands in a leaf with sufficient calibration support.
+    Sklearn-compatible classifier wrapping a fitted tree with calibration-support pruning.
 
-    Instead of redirecting samples post-hoc based on class profiles (which
-    breaks under prior probability shift), this modifies the routing: when a
-    sample would descend into a subtree with no supported leaves, it stops
-    at the nearest ancestor's representative supported leaf. [1]
+    Guarantees every sample lands in a leaf with calibration support.
+    Posteriors are computed from calibration label counts per leaf (smoothed).
     """
+    _estimator_type = "classifier"
 
-    def __init__(self, tree, leaf_ids_cal, y_cal, min_samples_per_leaf=1, n_classes=None):
-        """
-        Parameters
-        ----------
-        tree : fitted tree object with get_leaf_indices(X) method
-        leaf_ids_cal : array of leaf IDs from calibration data
-        y_cal : calibration labels
-        min_samples_per_leaf : minimum calibration samples for a leaf to be "supported"
-        n_classes : number of classes (inferred from y_cal if None)
-        """
+    def __init__(self, tree=None, min_calibration_samples=1, alpha=1.0, n_classes=None):
         self.tree = tree
-        self.n_classes_ = n_classes if n_classes is not None else len(np.unique(y_cal))
+        self.min_calibration_samples = min_calibration_samples
+        self.alpha = alpha
+        self.n_classes = n_classes
 
-        # Determine which leaves have sufficient calibration support
-        leaves, counts = np.unique(leaf_ids_cal, return_counts=True)
-        self.supported_leaf_ids = set(
+    def fit(self, X, y):
+        """
+        Fit the tree on X, y. Calibration (pruning + posteriors) happens
+        separately via calibrate().
+        """
+        X = np.asarray(X)
+        y = np.asarray(y)
+
+        if self.n_classes is not None:
+            self.classes_ = np.arange(self.n_classes)
+        else:
+            self.classes_ = np.unique(y)
+        self.n_classes_ = len(self.classes_)
+
+        self.tree.fit(X, y)
+        self._is_calibrated = False
+        return self
+
+    def calibrate(self, X_val, y_val):
+        """
+        Calibrate: determine supported leaves and compute posteriors.
+        Must be called after fit() and before predict/predict_proba on test data.
+        """
+        X_val = np.asarray(X_val)
+        y_val = np.asarray(y_val)
+
+        leaf_ids_val = self.tree.get_leaf_indices(X_val)
+
+        # Determine which leaves have enough calibration support
+        leaves, counts = np.unique(leaf_ids_val, return_counts=True)
+        self.supported_leaves_ = set(
             int(leaf) for leaf, count in zip(leaves, counts)
-            if count >= min_samples_per_leaf
+            if count >= self.min_calibration_samples
         )
 
-        # Store calibration data per supported leaf for posteriors
-        self._leaf_cal_labels = {}
-        for leaf_id, label in zip(leaf_ids_cal, y_cal):
+        # Build per-leaf label counts (only for supported leaves)
+        self._leaf_label_counts = {}
+        for leaf_id, label in zip(leaf_ids_val, y_val):
             lid = int(leaf_id)
-            if lid in self.supported_leaf_ids:
-                if lid not in self._leaf_cal_labels:
-                    self._leaf_cal_labels[lid] = []
-                self._leaf_cal_labels[lid].append(int(label))
+            if lid in self.supported_leaves_:
+                if lid not in self._leaf_label_counts:
+                    self._leaf_label_counts[lid] = np.zeros(self.n_classes_, dtype=float)
+                if 0 <= int(label) < self.n_classes_:
+                    self._leaf_label_counts[lid][int(label)] += 1.0
 
-        # Build mapping from all observed cal leaves to supported leaves
-        # For unsupported leaves: find nearest supported leaf by tree structure
-        # For leaves never seen in calibration: handled at predict time
-        self._leaf_redirect = {}
-        unsupported_leaves = set(int(leaf) for leaf in leaves) - self.supported_leaf_ids
+        # Compute smoothed posteriors per leaf
+        self._leaf_posteriors = {}
+        for lid, counts_vec in self._leaf_label_counts.items():
+            self._leaf_posteriors[lid] = (
+                (counts_vec + self.alpha) /
+                (counts_vec.sum() + self.alpha * self.n_classes_)
+            )
 
-        if len(unsupported_leaves) > 0 and len(self.supported_leaf_ids) > 0:
-            # Simple fallback: map unsupported -> nearest supported by cal overlap
-            # This is only for the rare case where a cal leaf exists but is too sparse
-            supported_list = sorted(self.supported_leaf_ids)
-            for leaf in unsupported_leaves:
-                # Map to the supported leaf with most similar feature-space position
-                # Since we don't have tree structure access for custom trees,
-                # we use a uniform fallback — these samples are rare
-                self._leaf_redirect[leaf] = supported_list[0]
-
-        self.n_leaves_retained_ = len(self.supported_leaf_ids)
-
-    def get_leaf_indices(self, X):
-        """
-        Get leaf indices, mapping unsupported leaves to supported ones.
-        Every returned leaf ID is guaranteed to be in self.supported_leaf_ids.
-        """
-        raw_leaf_ids = self.tree.get_leaf_indices(X)
-        out = np.empty(len(raw_leaf_ids), dtype=int)
-
-        # Default fallback if everything fails
-        fallback = sorted(self.supported_leaf_ids)[0] if self.supported_leaf_ids else 0
-
-        for i, lid in enumerate(raw_leaf_ids):
-            lid_int = int(lid)
-            if lid_int in self.supported_leaf_ids:
-                out[i] = lid_int
-            elif lid_int in self._leaf_redirect:
-                out[i] = self._leaf_redirect[lid_int]
-            else:
-                # Leaf never seen in calibration at all — use fallback
-                out[i] = fallback
-
-        return out
-
-    def get_leaf_posteriors(self, alpha=1.0):
-        """
-        Compute P(class | leaf) for each supported leaf using calibration labels.
-        Returns dict: leaf_id -> posterior array of shape (n_classes,)
-        """
-        posteriors = {}
-        for leaf_id, labels in self._leaf_cal_labels.items():
-            counts = np.zeros(self.n_classes_, dtype=float)
-            for label in labels:
-                if 0 <= label < self.n_classes_:
-                    counts[label] += 1
-            # Smoothed posterior
-            posteriors[leaf_id] = (counts + alpha) / (counts.sum() + alpha * self.n_classes_)
-        return posteriors
-
-
-# =============================================================================
-# Transfer Matrix from Pruned Tree [1]
-# =============================================================================
-
-def build_transfer_matrix_from_pruned_tree(pruned_tree, leaf_ids_cal, y_cal, alpha=0.0):
-    """
-    Build P(leaf | class) transfer matrix from calibration data on a pruned tree.
-
-    All leaf_ids_cal should already be mapped to supported leaves.
-    Returns P matrix of shape (n_leaves, n_classes) where columns sum to 1,
-    plus leaf_to_row mapping.
-    """
-    n_classes = pruned_tree.n_classes_
-    supported_leaves = sorted(pruned_tree.supported_leaf_ids)
-    n_leaves = len(supported_leaves)
-    leaf_to_row = {leaf: i for i, leaf in enumerate(supported_leaves)}
-
-    # Count occurrences per (leaf, class)
-    counts = np.zeros((n_leaves, n_classes), dtype=float)
-    for leaf_id, label in zip(leaf_ids_cal, y_cal):
-        lid = int(leaf_id)
-        row = leaf_to_row.get(lid, None)
-        if row is not None and 0 <= int(label) < n_classes:
-            counts[row, int(label)] += 1
-
-    # Normalize per class: P(leaf | class) — each column sums to 1 [1]
-    P = np.zeros_like(counts)
-    for k in range(n_classes):
-        col_sum = counts[:, k].sum()
-        if col_sum > 0:
-            P[:, k] = (counts[:, k] + alpha) / (col_sum + alpha * n_leaves)
+        # Fallback: for unsupported leaves, find nearest supported leaf
+        # Simple approach: map to the supported leaf with most samples
+        if self.supported_leaves_:
+            self._fallback_leaf = max(
+                self._leaf_label_counts.keys(),
+                key=lambda lid: self._leaf_label_counts[lid].sum()
+            )
         else:
-            P[:, k] = np.ones(n_leaves, dtype=float) / n_leaves
+            self._fallback_leaf = None
 
-    return P, leaf_to_row, np.arange(n_classes)
+        self._is_calibrated = True
+        return self
+
+    def _resolve_leaf(self, leaf_id):
+        """Map a raw leaf ID to a supported leaf ID."""
+        lid = int(leaf_id)
+        if lid in self.supported_leaves_:
+            return lid
+        return self._fallback_leaf
+
+    def predict_proba(self, X):
+        X = np.asarray(X)
+        leaf_ids = self.tree.get_leaf_indices(X)
+        n = len(leaf_ids)
+        proba = np.full((n, self.n_classes_), 1.0 / self.n_classes_)
+
+        if not self._is_calibrated:
+            return proba
+
+        for i, lid in enumerate(leaf_ids):
+            resolved = self._resolve_leaf(lid)
+            if resolved is not None and resolved in self._leaf_posteriors:
+                proba[i] = self._leaf_posteriors[resolved]
+
+        return proba
+
+    def predict(self, X):
+        proba = self.predict_proba(X)
+        return self.classes_[np.argmax(proba, axis=1)]
 
 
 # =============================================================================
-# EM Solver (from v6) [1]
+# Transfer Matrix + EM (our custom leaf-based EM from v6) [1]
 # =============================================================================
+
+def build_transfer_matrix(tree, X_val, y_val, n_classes, min_calibration_samples=1, alpha=1.0):
+    """
+    Build P(leaf | class) from calibration data, only using supported leaves.
+    Returns P, leaf_to_row mapping.
+    """
+    leaf_ids_val = tree.get_leaf_indices(X_val)
+    leaves, counts = np.unique(leaf_ids_val, return_counts=True)
+
+    supported_leaves = sorted(
+        int(leaf) for leaf, count in zip(leaves, counts)
+        if count >= min_calibration_samples
+    )
+
+    if len(supported_leaves) == 0:
+        # Degenerate case
+        return np.ones((1, n_classes)) / n_classes, {0: 0}, {0}
+
+    leaf_to_row = {leaf: i for i, leaf in enumerate(supported_leaves)}
+    n_leaves = len(supported_leaves)
+    supported_set = set(supported_leaves)
+
+    # Count per (leaf, class), only for supported leaves
+    counts_matrix = np.zeros((n_leaves, n_classes), dtype=float)
+    for leaf_id, label in zip(leaf_ids_val, y_val):
+        lid = int(leaf_id)
+        if lid in supported_set and 0 <= int(label) < n_classes:
+            counts_matrix[leaf_to_row[lid], int(label)] += 1.0
+
+    # Normalize per class: P(leaf | class) [1][3]
+    P = np.zeros((n_leaves, n_classes), dtype=float)
+    for k in range(n_classes):
+        col_sum = counts_matrix[:, k].sum()
+        if col_sum > 0:
+            P[:, k] = (counts_matrix[:, k] + alpha) / (col_sum + alpha * n_leaves)
+        else:
+            P[:, k] = np.ones(n_leaves) / n_leaves
+
+    return P, leaf_to_row, supported_set
+
 
 def em_estimate_prevalence(counts_vec, P, init_pi=None, tol=1e-8, max_iter=500):
     """
-    EM optimization: given test leaf counts and P(leaf|class), estimate prevalence.
-
-    Parameters
-    ----------
-    counts_vec : array of shape (n_leaves,), test sample counts per leaf
-    P : array of shape (n_leaves, n_classes), P(leaf | class)
-    init_pi : initial prevalence estimate
+    EM on leaf counts with P(leaf|class) matrix. [1]
     """
     n_leaves, n_classes = P.shape
     total = counts_vec.sum()
@@ -202,166 +209,55 @@ def em_estimate_prevalence(counts_vec, P, init_pi=None, tol=1e-8, max_iter=500):
         pi = np.clip(pi, 1e-12, None)
         pi /= pi.sum()
 
-    for it in range(1, max_iter + 1):
-        # E-step: P(class | leaf) ∝ P(leaf | class) * pi
-        mix = P @ pi  # shape (n_leaves,)
+    for _ in range(1, max_iter + 1):
+        mix = P @ pi
         mix = np.clip(mix, 1e-12, None)
-
-        # Responsibility: R[j, k] = P[j, k] * pi[k] / mix[j]
         R = (P * pi[None, :]) / mix[:, None]
-
-        # M-step: new pi = weighted average of responsibilities
         pi_new = (counts_vec[:, None] * R).sum(axis=0) / total
         pi_new = np.clip(pi_new, 1e-12, None)
         pi_new /= pi_new.sum()
 
         if np.sum(np.abs(pi_new - pi)) < tol:
-            pi = pi_new
-            break
+            return pi_new
         pi = pi_new
 
     return pi
 
 
-# =============================================================================
-# ACC Solver [1]
-# =============================================================================
+class _FittedLeafEM:
+    """Leaf-count EM estimator (the QTree-EM approach from v6) [1]."""
 
-def acc_estimate_prevalence(counts_vec, P):
-    """
-    Adjusted Classify & Count via matrix inversion of P(leaf|class).
+    def __init__(self, tree, P, leaf_to_row, supported_set, fallback_leaf=None):
+        self.tree = tree
+        self.P = P
+        self.leaf_to_row = leaf_to_row
+        self.supported_set = supported_set
+        self.fallback_leaf = fallback_leaf
 
-    For binary: equivalent to (p_hat - fpr) / (tpr - fpr).
-    For multiclass: solves P^T @ pi = observed_leaf_distribution via least squares.
-    """
-    n_leaves, n_classes = P.shape
-    total = counts_vec.sum()
+    def quantify(self, X_test):
+        leaf_ids = self.tree.get_leaf_indices(X_test)
+        n_rows = self.P.shape[0]
+        counts = np.zeros(n_rows, dtype=float)
 
-    if total <= 0:
-        return np.ones(n_classes, dtype=float) / n_classes
+        for lid in leaf_ids:
+            lid_int = int(lid)
+            if lid_int in self.leaf_to_row:
+                counts[self.leaf_to_row[lid_int]] += 1.0
+            elif self.fallback_leaf is not None and self.fallback_leaf in self.leaf_to_row:
+                counts[self.leaf_to_row[self.fallback_leaf]] += 1.0
+            # else: skip (like v6 does) [1]
 
-    # Observed leaf distribution
-    observed = counts_vec / total
-
-    # Solve: P^T @ pi = observed (least squares, constrained to simplex)
-    # P^T is (n_classes, n_leaves), pi is (n_classes,)
-    # observed is (n_leaves,)
-    # We want pi such that P @ pi ≈ observed (mixture model)
-
-    try:
-        # Least squares solution
-        result, _, _, _ = np.linalg.lstsq(P, observed, rcond=None)
-        result = np.clip(result, 0.0, None)
-        if result.sum() > 0:
-            result /= result.sum()
-        else:
-            result = np.ones(n_classes, dtype=float) / n_classes
-    except np.linalg.LinAlgError:
-        result = np.ones(n_classes, dtype=float) / n_classes
-
-    return result
+        return em_estimate_prevalence(counts, self.P)
 
 
 # =============================================================================
-# SLD-EM (Saerens et al.) [1][2]
-# =============================================================================
-
-def sld_em(posteriors_test, init_pi, tol=1e-6, max_iter=1000):
-    """
-    Saerens et al. EM on per-sample posterior scores.
-
-    Parameters
-    ----------
-    posteriors_test : array of shape (n_samples, n_classes), P(class|x) estimates
-    init_pi : initial prevalence (training prevalence)
-    """
-    scores = np.asarray(posteriors_test, dtype=float)
-    n_classes = scores.shape[1]
-
-    if scores.shape[0] == 0:
-        return np.ones(n_classes, dtype=float) / n_classes
-
-    pi = np.asarray(init_pi, dtype=float).copy()
-    if pi.sum() <= 0:
-        pi = np.ones(n_classes, dtype=float) / n_classes
-    else:
-        pi = pi / pi.sum()
-
-    for _ in range(max_iter):
-        # Adjust posteriors by ratio of current pi to training pi
-        denom = scores @ pi
-        denom[denom <= 0] = 1e-12
-        r = (scores * pi[None, :]) / denom[:, None]
-        new_pi = r.mean(axis=0)
-        new_pi = np.maximum(new_pi, 0)
-        if new_pi.sum() <= 0:
-            break
-        new_pi /= new_pi.sum()
-
-        if np.sum(np.abs(new_pi - pi)) < tol:
-            pi = new_pi
-            break
-        pi = new_pi
-
-    return pi
-
-
-# =============================================================================
-# Platt Calibration [1]
-# =============================================================================
-
-class PlattCalibrator:
-    """Per-class Platt scaling using logistic regression on raw posteriors."""
-
-    def __init__(self, random_state=None):
-        self.random_state = random_state
-        self.calibrators_ = None
-
-    def fit(self, probs_val, y_val, classes):
-        """Fit one LR calibrator per class."""
-        probs_val = np.asarray(probs_val, dtype=float)
-        y_val = np.asarray(y_val)
-        self.classes_ = np.asarray(classes)
-        self.calibrators_ = []
-
-        for idx, cls in enumerate(self.classes_):
-            y_bin = (y_val == cls).astype(int)
-            if np.unique(y_bin).size < 2:
-                self.calibrators_.append(None)
-                continue
-            cal = LogisticRegression(
-                max_iter=1000, solver="lbfgs", random_state=self.random_state
-            )
-            cal.fit(probs_val[:, [idx]], y_bin)
-            self.calibrators_.append(cal)
-
-        return self
-
-    def transform(self, probs):
-        """Apply calibrators and renormalize."""
-        probs = np.asarray(probs, dtype=float)
-        calibrated = np.zeros_like(probs)
-
-        for idx, cal in enumerate(self.calibrators_):
-            if cal is None:
-                calibrated[:, idx] = probs[:, idx]
-            else:
-                calibrated[:, idx] = cal.predict_proba(probs[:, [idx]])[:, 1]
-
-        row_sums = calibrated.sum(axis=1, keepdims=True)
-        row_sums[row_sums <= 0] = 1.0
-        return calibrated / row_sums
-
-
-# =============================================================================
-# HDX (Hellinger Distance) Estimator [1]
+# HDX Estimator [1]
 # =============================================================================
 
 def build_score_histograms(scores, y, n_classes, n_bins=300):
-    """Build per-class score histograms on calibration data."""
+    """Build per-class score histograms from calibration scores."""
     edges = np.linspace(0.0, 1.0, n_bins + 1)
     histograms = []
-
     for k in range(n_classes):
         mask = (y == k)
         h, _ = np.histogram(scores[mask], bins=edges)
@@ -370,15 +266,11 @@ def build_score_histograms(scores, y, n_classes, n_bins=300):
             h[:] = 1.0
         h /= h.sum()
         histograms.append(h)
-
     return {"edges": edges, "histograms": histograms, "n_classes": n_classes}
 
 
 def hdx_estimate(scores_test, hist_model, grid_size=1001):
-    """
-    HDX prevalence estimate for binary case.
-    For multiclass, uses grid search over simplex (binary only for now).
-    """
+    """Binary HDX prevalence estimate via Hellinger distance minimization. [1]"""
     n_classes = hist_model["n_classes"]
     edges = hist_model["edges"]
 
@@ -391,10 +283,8 @@ def hdx_estimate(scores_test, hist_model, grid_size=1001):
     if n_classes == 2:
         h0 = hist_model["histograms"][0]
         h1 = hist_model["histograms"][1]
-
         q_grid = np.linspace(0.0, 1.0, grid_size)
-        best_q = 0.5
-        best_dist = np.inf
+        best_q, best_dist = 0.5, np.inf
 
         for q in q_grid:
             mix = (1.0 - q) * h0 + q * h1
@@ -407,222 +297,90 @@ def hdx_estimate(scores_test, hist_model, grid_size=1001):
 
         return np.array([1.0 - best_q, best_q])
     else:
-        # Multiclass: fall back to EM-style approach on histograms
-        # (simplified — proper implementation would search simplex)
-        return np.ones(n_classes, dtype=float) / n_classes
+        return np.ones(n_classes) / n_classes
 
 
-# =============================================================================
-# Fitted Estimator Wrappers (simplified — tree is already pruned)
-# =============================================================================
+class _FittedHDX:
+    """Pre-fitted HDX estimator."""
 
-class _FittedEMEstimator:
-    """EM quantifier on leaf counts."""
-
-    def __init__(self, pruned_tree, P, leaf_to_row):
-        self.pruned_tree = pruned_tree
-        self.P = P
-        self.leaf_to_row = leaf_to_row
-
-    def quantify(self, X_test):
-        leaf_ids = self.pruned_tree.get_leaf_indices(X_test)
-        n_rows = self.P.shape[0]
-        counts = np.zeros(n_rows, dtype=float)
-        for lid in leaf_ids:
-            row = self.leaf_to_row.get(int(lid), None)
-            if row is not None:
-                counts[row] += 1.0
-        return em_estimate_prevalence(counts, self.P)
-
-
-class _FittedACCEstimator:
-    """ACC quantifier on leaf counts."""
-
-    def __init__(self, pruned_tree, P, leaf_to_row):
-        self.pruned_tree = pruned_tree
-        self.P = P
-        self.leaf_to_row = leaf_to_row
-
-    def quantify(self, X_test):
-        leaf_ids = self.pruned_tree.get_leaf_indices(X_test)
-        n_rows = self.P.shape[0]
-        counts = np.zeros(n_rows, dtype=float)
-        for lid in leaf_ids:
-            row = self.leaf_to_row.get(int(lid), None)
-            if row is not None:
-                counts[row] += 1.0
-        return acc_estimate_prevalence(counts, self.P)
-
-
-class _FittedSLDEstimator:
-    """SLD-EM on per-sample posteriors from pruned tree leaves."""
-
-    def __init__(self, pruned_tree, leaf_posteriors, pi_train):
-        self.pruned_tree = pruned_tree
-        self.leaf_posteriors = leaf_posteriors  # dict: leaf_id -> posterior
-        self.pi_train = pi_train
-        self.n_classes_ = pruned_tree.n_classes_
-
-    def quantify(self, X_test):
-        leaf_ids = self.pruned_tree.get_leaf_indices(X_test)
-        n = len(leaf_ids)
-        scores = np.zeros((n, self.n_classes_), dtype=float)
-        fallback = self.pi_train
-
-        for i, lid in enumerate(leaf_ids):
-            post = self.leaf_posteriors.get(int(lid), None)
-            if post is not None:
-                scores[i] = post
-            else:
-                scores[i] = fallback
-
-        return sld_em(scores, init_pi=self.pi_train)
-
-
-class _FittedPlattSLDEstimator:
-    """SLD-EM with Platt-calibrated posteriors from the pruned tree."""
-
-    def __init__(self, pruned_tree, leaf_posteriors, platt_calibrator, pi_train):
-        self.pruned_tree = pruned_tree
-        self.leaf_posteriors = leaf_posteriors
-        self.platt = platt_calibrator
-        self.pi_train = pi_train
-        self.n_classes_ = pruned_tree.n_classes_
-
-    def quantify(self, X_test):
-        leaf_ids = self.pruned_tree.get_leaf_indices(X_test)
-        n = len(leaf_ids)
-        raw_scores = np.zeros((n, self.n_classes_), dtype=float)
-        fallback = self.pi_train
-
-        for i, lid in enumerate(leaf_ids):
-            post = self.leaf_posteriors.get(int(lid), None)
-            if post is not None:
-                raw_scores[i] = post
-            else:
-                raw_scores[i] = fallback
-
-        calibrated = self.platt.transform(raw_scores)
-        return sld_em(calibrated, init_pi=self.pi_train)
-
-
-class _FittedLRPlattSLDEstimator:
-    """LR classifier + Platt calibration + SLD-EM."""
-
-    def __init__(self, lr_model, platt_calibrator, classes, pi_train):
-        self.lr_model = lr_model
-        self.platt = platt_calibrator
-        self.classes = classes
-        self.pi_train = pi_train
-
-    def quantify(self, X_test):
-        probs = self.lr_model.predict_proba(X_test)
-        # Align to expected classes
-        probs_aligned = _align_probabilities_to_classes(
-            probs, self.lr_model.classes_, self.classes
-        )
-        calibrated = self.platt.transform(probs_aligned)
-        return sld_em(calibrated, init_pi=self.pi_train)
-
-
-class _FittedHDXEstimator:
-    """HDX estimator using Platt-calibrated scores."""
-
-    def __init__(self, pruned_tree, leaf_posteriors, platt_calibrator, hist_model, pi_train, class_idx=1):
-        self.pruned_tree = pruned_tree
-        self.leaf_posteriors = leaf_posteriors
-        self.platt = platt_calibrator
+    def __init__(self, clf, hist_model, grid_size=1001, class_idx=1):
+        self.clf = clf
         self.hist_model = hist_model
-        self.pi_train = pi_train
+        self.grid_size = grid_size
         self.class_idx = class_idx
-        self.n_classes_ = pruned_tree.n_classes_
 
     def quantify(self, X_test):
-        leaf_ids = self.pruned_tree.get_leaf_indices(X_test)
-        n = len(leaf_ids)
-        raw_scores = np.zeros((n, self.n_classes_), dtype=float)
-        fallback = self.pi_train
-
-        for i, lid in enumerate(leaf_ids):
-            post = self.leaf_posteriors.get(int(lid), None)
-            if post is not None:
-                raw_scores[i] = post
-            else:
-                raw_scores[i] = fallback
-
-        calibrated = self.platt.transform(raw_scores)
-        # Use the positive class score for histogram matching
-        scores_1d = calibrated[:, self.class_idx]
-        return hdx_estimate(scores_1d, self.hist_model)
+        proba = self.clf.predict_proba(X_test)
+        scores = proba[:, self.class_idx]
+        return hdx_estimate(scores, self.hist_model, self.grid_size)
 
 
-class _FittedKDEyEstimator:
-    """Pre-fitted KDEyML wrapper."""
+# =============================================================================
+# QuaPy Wrappers
+# =============================================================================
 
-    def __init__(self, kdey_model, classes):
-        self.kdey_model = kdey_model
+class _FittedQuaPyEstimator:
+    """Wrapper for a fitted QuaPy quantifier."""
+
+    def __init__(self, quapy_model, classes):
+        self.quapy_model = quapy_model
         self.classes = classes
 
     def quantify(self, X_test):
-        return self.kdey_model.quantify(X_test)
+        # QuaPy returns prevalence in the order of its internal classes
+        return self.quapy_model.quantify(X_test)
 
 
-# =============================================================================
-# KDEy-compatible classifier wrapper for pruned tree
-# =============================================================================
-
-class PrunedTreeClassifier(ClassifierMixin, BaseEstimator):
-    """Sklearn-compatible classifier wrapping a CalibrationSupportPrunedTree."""
-    _estimator_type = "classifier"
-
-    def __init__(self, pruned_tree=None, leaf_posteriors=None, classes=None):
-        self.pruned_tree = pruned_tree
-        self.leaf_posteriors = leaf_posteriors
-        self.classes_ = classes
-        self.n_classes_ = len(classes) if classes is not None else 2
-
-    def fit(self, X, y):
-        # Already fitted — no-op
-        return self
-
-    def predict_proba(self, X):
-        leaf_ids = self.pruned_tree.get_leaf_indices(X)
-        n = len(leaf_ids)
-        proba = np.full((n, self.n_classes_), 1.0 / self.n_classes_)
-        for i, lid in enumerate(leaf_ids):
-            post = self.leaf_posteriors.get(int(lid), None)
-            if post is not None:
-                proba[i] = post
-        return proba
-
-    def predict(self, X):
-        proba = self.predict_proba(X)
-        return self.classes_[np.argmax(proba, axis=1)]
+def _fit_quapy_acc(clf, X_val, y_val, classes):
+    """
+    Fit QuaPy ACC using the pruned tree classifier.
+    val_split=(X_val, y_val) tells ACC to use this specific data
+    for computing the misclassification matrix.
+    """
+    acc = ACC(
+        classifier=clf,
+        fit_classifier=False,
+        val_split=(X_val, y_val),
+        solver='minimize',
+        norm='clip',
+    )
+    # QuaPy needs a LabelledCollection for fit, but with fit_classifier=False
+    # and val_split as tuple, it just computes the confusion matrix from val_split.
+    # We still need to call fit() — it won't retrain the classifier.
+    lc_dummy = LabelledCollection(X_val, y_val, classes=classes)
+    acc.fit(lc_dummy)
+    return acc
 
 
-# =============================================================================
-# Utility
-# =============================================================================
+def _fit_quapy_emq(clf, X_val, y_val, classes, exact_train_prev=True):
+    """
+    Fit QuaPy EMQ (SLD) using the pruned tree classifier.
+    val_split=(X_val, y_val) provides the data for estimating training prevalence
+    and calibrating posteriors.
+    """
+    emq = EMQ(
+        classifier=clf,
+        fit_classifier=False,
+        val_split=(X_val, y_val),
+        exact_train_prev=exact_train_prev,
+    )
+    lc_dummy = LabelledCollection(X_val, y_val, classes=classes)
+    emq.fit(lc_dummy)
+    return emq
 
-def _align_probabilities_to_classes(probs, model_classes, expected_classes):
-    """Expand a probability matrix to the expected class set."""
-    probs = np.asarray(probs, dtype=float)
-    model_classes = np.asarray(model_classes)
-    expected_classes = np.asarray(expected_classes)
-    aligned = np.zeros((probs.shape[0], len(expected_classes)), dtype=float)
-    class_to_col = {cls: idx for idx, cls in enumerate(model_classes)}
-    for idx, cls in enumerate(expected_classes):
-        col = class_to_col.get(cls, None)
-        if col is not None and col < probs.shape[1]:
-            aligned[:, idx] = probs[:, col]
-    return aligned
 
-
-def _prevalence(y, classes):
-    counts = np.array([np.sum(y == c) for c in classes], dtype=float)
-    if counts.sum() == 0:
-        return np.ones(len(classes)) / len(classes)
-    return counts / counts.sum()
+def _fit_quapy_kdey(clf, X_val, y_val, classes, bandwidth=0.05, random_state=None):
+    """Fit QuaPy KDEyML using the pruned tree classifier."""
+    kdey = KDEyML(
+        classifier=clf,
+        fit_classifier=False,
+        val_split=(X_val, y_val),
+        bandwidth=bandwidth,
+        random_state=random_state,
+    )
+    lc_dummy = LabelledCollection(X_val, y_val, classes=classes)
+    kdey.fit(lc_dummy)
+    return kdey
 
 
 # =============================================================================
@@ -660,6 +418,13 @@ def _rae(p_true, p_hat, eps=1e-8):
     return (np.abs(p_true - p_hat) / p_true).mean(axis=-1)
 
 
+def _prevalence(y, classes):
+    counts = np.array([np.sum(y == c) for c in classes], dtype=float)
+    if counts.sum() == 0:
+        return np.ones(len(classes)) / len(classes)
+    return counts / counts.sum()
+
+
 def _evaluate(p_true, p_hat):
     n_classes = len(p_true)
     return {
@@ -674,7 +439,7 @@ def _evaluate(p_true, p_hat):
 # =============================================================================
 
 TREE_CHOICES = ["gini", "qeb", "qcqb"]
-ESTIMATOR_CHOICES = ["em", "em_smooth", "acc", "sld", "platt_sld", "lr_platt_sld", "hdx", "kdey"]
+ESTIMATOR_CHOICES = ["leaf_em", "acc", "sld", "sld_bcts", "hdx", "kdey"]
 
 
 # =============================================================================
@@ -686,7 +451,6 @@ def parse_args():
     parser.add_argument(
         "-d", "--datasets", nargs="*", type=str,
         choices=DATASET_LIST, default=DATASET_LIST,
-        help="Datasets used in evaluation."
     )
     parser.add_argument(
         "--modes", nargs="+",
@@ -694,15 +458,9 @@ def parse_args():
         default=[BINARY_MODE_KEY, MULTICLASS_MODE_KEY],
     )
     parser.add_argument("--seeds", nargs="+", type=int, default=GLOBAL_SEEDS)
-    parser.add_argument(
-        "--trees", nargs="+", choices=TREE_CHOICES, default=TREE_CHOICES,
-    )
-    parser.add_argument(
-        "--estimators", nargs="+", choices=ESTIMATOR_CHOICES, default=ESTIMATOR_CHOICES,
-    )
-    parser.add_argument(
-        "--min-calibration-samples", nargs="+", type=int, default=[1, 5],
-    )
+    parser.add_argument("--trees", nargs="+", choices=TREE_CHOICES, default=TREE_CHOICES)
+    parser.add_argument("--estimators", nargs="+", choices=ESTIMATOR_CHOICES, default=ESTIMATOR_CHOICES)
+    parser.add_argument("--min-calibration-samples", nargs="+", type=int, default=[1, 5])
     parser.add_argument("--max-depth", type=int, default=None)
     parser.add_argument("--min-samples-leaf", type=int, default=1)
     parser.add_argument("--qeb-max-features", type=float, default=None)
@@ -715,10 +473,7 @@ def parse_args():
     parser.add_argument("--minsize", type=int, default=None)
     parser.add_argument("--maxsize", type=int, default=None)
     parser.add_argument("--verbose", action="store_true")
-    parser.add_argument(
-        "--dt", type=int, nargs="+", default=None,
-        help="Index for train/test-splits to be run from TRAIN_TEST_RATIOS."
-    )
+    parser.add_argument("--dt", type=int, nargs="+", default=None)
     parser.add_argument("--manifest", type=str, default=None)
     parser.add_argument("--task-id", type=int, default=None)
     parser.add_argument("--n-tasks", type=int, default=None)
@@ -782,15 +537,14 @@ def run_single_unit(
     load_from_disk, em_alpha, hdx_bins, hdx_grid_size, verbose,
 ):
     """
-    Run all tree/estimator/min_cal combinations for a single
-    (dataset, seed, dt_ratio, train_distr, test_distr) draw.
+    Run all tree/estimator/min_cal combinations for a single experimental draw.
 
     Architecture:
     1. Fit tree on training data
-    2. For each min_calibration_samples threshold:
-       a. Build CalibrationSupportPrunedTree (ensures all test leaves are supported)
-       b. Build transfer matrix P(leaf|class) from calibration data on pruned tree
-       c. Run each estimator using the pruned tree
+    2. Calibrate (determine supported leaves + posteriors) on validation data
+    3. For ACC/SLD: use QuaPy with the calibrated tree as classifier
+    4. For leaf_em: use our EM on P(leaf|class) directly [1]
+    5. For hdx: use histogram matching on calibrated scores [1]
     """
     X, y, N, Y, n_classes, y_cts, y_idx = helpers.get_xy(
         dta_name, load_from_disk=load_from_disk, binned=False,
@@ -808,8 +562,7 @@ def run_single_unit(
 
     if len(train_index) == 0 or len(test_index) == 0:
         if verbose:
-            print(f"  Skipping empty draw: dt={dt_ratio}, "
-                  f"train_d={train_distr}, test_d={test_distr}")
+            print(f"  Skipping empty draw")
         return []
 
     X_train_full = X[train_index]
@@ -817,72 +570,53 @@ def run_single_unit(
     X_test = X[test_index]
     y_test = _map_labels(y[test_index])
 
-    # Split training into fit (75%) and calibration (25%)
+    # Split: 75% train, 25% calibration
     X_tr, y_tr, X_val, y_val = _split_train_val(
         X_train_full, y_train_full, val_fraction=0.25, seed=seed
     )
 
     pi_true = _prevalence(y_test, class_list)
-    pi_train = _prevalence(y_tr, class_list)
 
     rows = []
 
     for tree_name in trees:
-        tree = _build_tree(
+        raw_tree = _build_tree(
             tree_name, max_depth, min_samples_leaf, seed,
             qeb_max_features=qeb_max_features,
             qeb_max_thresholds=qeb_max_thresholds,
         )
 
-        # Fit tree ONCE on training data
-        tree.fit(X_tr, y_tr)
-
-        # Get raw leaf IDs on calibration data
-        leaf_ids_val_raw = tree.get_leaf_indices(X_val)
+        # Fit tree ONCE
+        raw_tree.fit(X_tr, y_tr)
 
         for min_cal in min_calibration_samples_list:
-            # ============================================================
-            # Build pruned tree — this is the key change from the old code.
-            # Every test sample is guaranteed to land in a supported leaf.
-            # No redirection based on class profiles. [1]
-            # ============================================================
-            pruned_tree = CalibrationSupportPrunedTree(
-                tree=tree,
-                leaf_ids_cal=leaf_ids_val_raw,
-                y_cal=y_val,
-                min_samples_per_leaf=min_cal,
+            # Build calibrated classifier
+            clf = PrunedTreeClassifier(
+                tree=raw_tree,
+                min_calibration_samples=min_cal,
+                alpha=em_alpha,
                 n_classes=n_classes,
             )
+            # We already fitted the tree inside PrunedTreeClassifier.fit would
+            # refit. Instead, manually set up the classifier state:
+            clf.classes_ = class_list
+            clf.n_classes_ = n_classes
+            clf._is_calibrated = False
+            clf.tree = raw_tree  # already fitted
 
-            # Get calibration leaf IDs through the pruned tree
-            # (some may be remapped to supported ancestors)
-            leaf_ids_val = pruned_tree.get_leaf_indices(X_val)
+            # Calibrate on validation data
+            clf.calibrate(X_val, y_val)
 
-            # Build transfer matrix P(leaf | class) [1]
-            P, leaf_to_row, classes = build_transfer_matrix_from_pruned_tree(
-                pruned_tree, leaf_ids_val, y_val, alpha=em_alpha
+            # Build transfer matrix for leaf-EM [1]
+            P, leaf_to_row, supported_set = build_transfer_matrix(
+                raw_tree, X_val, y_val, n_classes,
+                min_calibration_samples=min_cal, alpha=em_alpha,
             )
-
-            # Also build unsmoothed version for ACC
-            P_unsmoothed, _, _ = build_transfer_matrix_from_pruned_tree(
-                pruned_tree, leaf_ids_val, y_val, alpha=0.0
+            fallback_leaf = (
+                max(clf._leaf_label_counts.keys(),
+                    key=lambda lid: clf._leaf_label_counts[lid].sum())
+                if clf._leaf_label_counts else None
             )
-
-            # Leaf posteriors for SLD-based methods
-            leaf_posteriors = pruned_tree.get_leaf_posteriors(alpha=0.01)
-
-            # Platt calibrator (fit on calibration posteriors vs labels)
-            raw_scores_val = np.zeros((len(X_val), n_classes), dtype=float)
-            for i, lid in enumerate(leaf_ids_val):
-                post = leaf_posteriors.get(int(lid), None)
-                if post is not None:
-                    raw_scores_val[i] = post
-                else:
-                    raw_scores_val[i] = pi_train
-
-            platt = PlattCalibrator(random_state=seed)
-            platt.fit(raw_scores_val, y_val, classes=class_list)
-            cal_scores_val = platt.transform(raw_scores_val)
 
             for est_name in estimators:
                 if verbose:
@@ -891,84 +625,67 @@ def run_single_unit(
                         f"est={est_name}, min_cal={min_cal}"
                     )
 
-                # ==========================================================
-                # FIT ESTIMATOR
-                # ==========================================================
+                try:
+                    if est_name == "leaf_em":
+                        # Our custom leaf-count EM [1]
+                        fitted = _FittedLeafEM(
+                            raw_tree, P, leaf_to_row, supported_set, fallback_leaf
+                        )
+                        pi_hat = fitted.quantify(X_test)
 
-                if est_name == "em":
-                    # EM with Laplace smoothing on P(leaf|class) [1]
-                    fitted = _FittedEMEstimator(pruned_tree, P, leaf_to_row)
+                    elif est_name == "acc":
+                        # QuaPy ACC — uses confusion matrix from val data
+                        acc_model = _fit_quapy_acc(clf, X_val, y_val, class_list)
+                        pi_hat = acc_model.quantify(X_test)
 
-                elif est_name == "em_smooth":
-                    # Same as em (alpha already applied in P construction)
-                    fitted = _FittedEMEstimator(pruned_tree, P, leaf_to_row)
+                    elif est_name == "sld":
+                        # QuaPy EMQ (SLD) — uses classifier posteriors correctly
+                        emq_model = _fit_quapy_emq(
+                            clf, X_val, y_val, class_list, exact_train_prev=True
+                        )
+                        pi_hat = emq_model.quantify(X_test)
 
-                elif est_name == "acc":
-                    fitted = _FittedACCEstimator(pruned_tree, P_unsmoothed, leaf_to_row)
+                    elif est_name == "sld_bcts":
+                        # QuaPy EMQ with BCTS calibration
+                        emq_model = EMQ(
+                            classifier=clf,
+                            fit_classifier=False,
+                            val_split=(X_val, y_val),
+                            exact_train_prev=True,
+                            calib='bcts',
+                        )
+                        lc_dummy = LabelledCollection(X_val, y_val, classes=class_list)
+                        emq_model.fit(lc_dummy)
+                        pi_hat = emq_model.quantify(X_test)
 
-                elif est_name == "sld":
-                    fitted = _FittedSLDEstimator(
-                        pruned_tree, leaf_posteriors, pi_train
-                    )
-
-                elif est_name == "platt_sld":
-                    fitted = _FittedPlattSLDEstimator(
-                        pruned_tree, leaf_posteriors, platt, pi_train
-                    )
-
-                elif est_name == "lr_platt_sld":
-                    lr_model = LogisticRegression(max_iter=1000, solver="lbfgs")
-                    lr_model.fit(X_tr, y_tr)
-                    probs_val_lr = _align_probabilities_to_classes(
-                        lr_model.predict_proba(X_val), lr_model.classes_, class_list
-                    )
-                    platt_lr = PlattCalibrator(random_state=seed)
-                    platt_lr.fit(probs_val_lr, y_val, classes=class_list)
-                    fitted = _FittedLRPlattSLDEstimator(
-                        lr_model, platt_lr, class_list, pi_train
-                    )
-
-                elif est_name == "hdx":
-                    # HDX uses Platt-calibrated scores [1]
-                    if n_classes == 2:
+                    elif est_name == "hdx":
+                        # HDX on calibrated scores [1]
+                        if n_classes != 2:
+                            continue
+                        scores_val = clf.predict_proba(X_val)[:, 1]
                         hist_model = build_score_histograms(
-                            cal_scores_val[:, 1], y_val, n_classes=2, n_bins=hdx_bins
+                            scores_val, y_val, n_classes=2, n_bins=hdx_bins
                         )
-                        fitted = _FittedHDXEstimator(
-                            pruned_tree, leaf_posteriors, platt, hist_model, pi_train,
-                            class_idx=1,
+                        fitted_hdx = _FittedHDX(clf, hist_model, hdx_grid_size, class_idx=1)
+                        pi_hat = fitted_hdx.quantify(X_test)
+
+                    elif est_name == "kdey":
+                        # QuaPy KDEyML
+                        kdey_model = _fit_quapy_kdey(
+                            clf, X_val, y_val, class_list,
+                            bandwidth=kde_bandwidth, random_state=seed,
                         )
+                        pi_hat = kdey_model.quantify(X_test)
+
                     else:
-                        # HDX multiclass not fully implemented — skip
-                        continue
+                        raise ValueError(f"Unknown estimator: {est_name}")
 
-                elif est_name == "kdey":
-                    if not QUAPY_AVAILABLE:
-                        continue
-                    wrapper = PrunedTreeClassifier(
-                        pruned_tree=pruned_tree,
-                        leaf_posteriors=leaf_posteriors,
-                        classes=class_list,
-                    )
-                    kdey = KDEyML(
-                        classifier=wrapper,
-                        fit_classifier=False,
-                        val_split=(X_val, y_val),
-                        bandwidth=kde_bandwidth,
-                        random_state=seed,
-                    )
-                    kdey.fit(X_tr, y_tr)
-                    fitted = _FittedKDEyEstimator(kdey, class_list)
+                except Exception as e:
+                    if verbose:
+                        print(f"    ERROR: {e}")
+                    continue
 
-                else:
-                    raise ValueError(f"Unknown estimator: {est_name}")
-
-                # ==========================================================
-                # PREDICT
-                # ==========================================================
-
-                pi_hat = np.asarray(fitted.quantify(X_test), dtype=float)
-
+                pi_hat = np.asarray(pi_hat, dtype=float)
                 if len(pi_hat) != len(pi_true):
                     aligned = np.zeros(len(class_list))
                     aligned[:min(len(pi_hat), len(aligned))] = pi_hat[:len(aligned)]
@@ -986,7 +703,7 @@ def run_single_unit(
                     "tree": tree_name,
                     "estimator": est_name,
                     "min_calibration_samples": int(min_cal),
-                    "n_leaves_retained": int(pruned_tree.n_leaves_retained_),
+                    "n_leaves_retained": len(clf.supported_leaves_),
                     "AE": metrics["AE"],
                     "RAE": metrics["RAE"],
                     "NKLD": metrics["NKLD"],
@@ -998,7 +715,7 @@ def run_single_unit(
 
 
 # =============================================================================
-# Main entry point
+# Main
 # =============================================================================
 
 def main():
@@ -1008,8 +725,7 @@ def main():
     # MODE 1: Manifest-based parallelization
     # ------------------------------------------------------------------
     if args.manifest is not None:
-        assert args.task_id is not None and args.n_tasks is not None, \
-            "--task-id and --n-tasks required with --manifest"
+        assert args.task_id is not None and args.n_tasks is not None
 
         with open(args.manifest) as f:
             all_units = [line.strip().split(",") for line in f if line.strip()]
@@ -1030,8 +746,7 @@ def main():
             test_distr = test_ds[int(te_idx_str)]
 
             if args.verbose:
-                print(f"  [{i+1}/{len(my_units)}] {dta_name} seed={seed} "
-                      f"dt={dt_ratio} train_d={train_distr} test_d={test_distr}")
+                print(f"  [{i+1}/{len(my_units)}] {dta_name} seed={seed}")
 
             rows = run_single_unit(
                 dta_name=dta_name, seed=seed, dt_ratio=dt_ratio,
