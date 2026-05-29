@@ -572,7 +572,7 @@ def run_single_unit(
 
     # Split: 75% train, 25% calibration
     X_tr, y_tr, X_val, y_val = _split_train_val(
-        X_train_full, y_train_full, val_fraction=0.25, seed=seed
+        X_train_full, y_train_full, val_fraction=0.5, seed=seed
     )
 
     pi_true = _prevalence(y_test, class_list)
